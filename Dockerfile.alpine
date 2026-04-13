@@ -1,0 +1,18 @@
+FROM alpine:3.18
+
+# Instalar Node.js en Alpine (mucho más ligero)
+RUN apk add --no-cache nodejs npm
+
+WORKDIR /app
+
+# Copiar código pre-compilado desde el host
+COPY dist ./dist
+COPY package.json pnpm-lock.yaml ./
+COPY prisma ./prisma
+
+# Instalar dependencias de producción
+RUN npm install --prod
+
+EXPOSE 3010
+
+CMD ["node", "dist/main"]

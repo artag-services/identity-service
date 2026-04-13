@@ -1,0 +1,18 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install pnpm  
+RUN npm install -g pnpm
+
+# Copy pre-built code from host (requires dist folder to be built locally)
+COPY dist ./dist
+COPY package.json pnpm-lock.yaml ./
+COPY prisma ./prisma
+
+# Install production dependencies only
+RUN pnpm install --prod --frozen-lockfile
+
+EXPOSE 3010
+
+CMD ["node", "dist/main"]

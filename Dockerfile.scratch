@@ -1,0 +1,19 @@
+# Dockerfile sin descargas externas - todo compilado localmente
+# Usa binarios del host copiados a scratch
+
+FROM scratch
+
+WORKDIR /app
+
+# Copiar aplicación pre-compilada y sus dependencias
+COPY dist ./dist
+COPY package.json ./
+COPY prisma ./prisma
+COPY node_modules ./node_modules
+
+# Copiar binarios de Node.js necesarios del build context
+COPY node_modules/.bin/node /bin/node
+
+EXPOSE 3010
+
+CMD ["/bin/node", "dist/main"]
