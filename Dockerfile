@@ -24,11 +24,14 @@ RUN pnpm build
 FROM node:20-alpine
 
 # Install OpenSSL and other runtime dependencies for Prisma
-RUN apk add --no-cache openssl
+RUN apk add --no-cache openssl netcat-openbsd bash
 
 WORKDIR /app
 
 RUN npm install -g pnpm
+
+# Copy entrypoint first
+COPY entrypoint.sh ./
 
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --prod --frozen-lockfile
@@ -37,6 +40,9 @@ COPY prisma ./prisma
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules/.pnpm /app/node_modules/.pnpm
 
+RUN chmod +x /app/entrypoint.sh
+
 EXPOSE 3010
 
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["node", "dist/main"]
