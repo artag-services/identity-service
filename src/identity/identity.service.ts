@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { RabbitMQService } from '../rabbitmq/rabbitmq.service';
 import { ResolveIdentityDto, MergeUsersDto } from './dto';
 import { User, UserIdentity, UserContact } from '@prisma/client';
 import { v4 as uuid } from 'uuid';
@@ -9,6 +10,21 @@ interface MatchResult {
   matchType: 'phone' | 'email' | 'username' | 'new';
   confidence: number;
 }
+
+/**
+ * `data.*` routing keys this service emits to the CQRS bus. Sync-service
+ * subscribes to `data.#` and projects these into MongoDB.
+ *
+ * Rule: every successful write to our own Postgres MUST be followed by
+ * publishing a structured event here. The read model is downstream and
+ * stale until it consumes these events.
+ */
+const DATA_EVENTS = {
+  USER_CREATED: 'data.identity.user.created',
+  USER_LINKED: 'data.identity.user.linked',
+  USER_NAME_UPDATED: 'data.identity.user.name-updated',
+  USER_DELETED: 'data.identity.user.deleted',
+} as const;
 
 @Injectable()
 export class IdentityService {
@@ -25,7 +41,10 @@ export class IdentityService {
     tiktok: 0.70,
   };
 
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private rabbitmq: RabbitMQService,
+  ) {}
 
   /// Resolve or create a user identity
   async resolveIdentity(dto: ResolveIdentityDto): Promise<User> {
@@ -44,36 +63,31 @@ export class IdentityService {
       include: { user: true },
     });
 
-    if (existingIdentity) {
-      this.logger.debug(
-        `Identity already exists for user ${existingIdentity.userId}`,
-      );
-      // Update identity with new info if provided
-      await this.updateUserIdentity(existingIdentity.id, dto);
-      return existingIdentity.user;
-    }
-
-    // Try to match with existing user by phone, email, or username
-    const match = await this.findMatchingUser(dto);
-
     let user: User;
-    if (match && match.userId) {
-      // Link to existing user
-      this.logger.debug(
-        `Found matching user ${match.userId} via ${match.matchType}`,
-      );
-      user = await this.linkIdentityToUser(match.userId, dto);
+    let isNewUser = false;
+
+    if (existingIdentity) {
+      this.logger.debug(`Identity already exists for user ${existingIdentity.userId}`);
+      await this.updateUserIdentity(existingIdentity.id, dto);
+      user = existingIdentity.user;
     } else {
-      // Create new user
-      this.logger.debug(
-        `No match found, creating new user for identity ${dto.channelUserId}`,
-      );
-      user = await this.createNewUser(dto);
+      // Try to match with existing user by phone, email, or username
+      const match = await this.findMatchingUser(dto);
+      if (match && match.userId) {
+        this.logger.debug(`Found matching user ${match.userId} via ${match.matchType}`);
+        user = await this.linkIdentityToUser(match.userId, dto);
+      } else {
+        this.logger.debug(`No match found, creating new user for identity ${dto.channelUserId}`);
+        user = await this.createNewUser(dto);
+        isNewUser = true;
+      }
+      // Create user contact records (only on first sight; existing-identity path doesn't change contacts)
+      await this.createUserContacts(user.id, dto);
     }
 
-    // Create user contact records
-    await this.createUserContacts(user.id, dto);
-
+    // ─── CQRS: emit events after ALL Postgres writes succeed ───
+    // Postgres is source of truth; sync-service projects this into Mongo.
+    await this.publishUserSnapshot(user.id, dto.channel, dto.channelUserId, { isNewUser });
     return user;
   }
 
@@ -505,15 +519,38 @@ export class IdentityService {
 
     this.logger.debug(`Successfully merged users. Primary now has ${updated.identities.length} identities`);
 
+    // ─── CQRS: announce the moved identities + the deleted secondary ───
+    // For each identity that just got reparented, emit a user.linked event so
+    // the read model attaches it to the primary's UnifiedUser. Then mark the
+    // secondary as deleted so it disappears from query results.
+    for (const identity of secondary.identities) {
+      await this.publishUserSnapshot(primaryUserId, identity.channel, identity.channelUserId)
+        .catch((e) =>
+          this.logger.warn(
+            `Failed to publish post-merge linked event for ${identity.channel}:${identity.channelUserId}: ${(e as Error).message}`,
+          ),
+        );
+    }
+    await this.publishUserDeleted(secondaryUserId, 'merged', { mergedInto: primaryUserId, reason })
+      .catch((e) =>
+        this.logger.warn(`Failed to publish user.deleted for merged secondary: ${(e as Error).message}`),
+      );
+
     return updated;
   }
 
   /// Soft delete a user
   async deleteUser(userId: string): Promise<User> {
-    return this.prisma.user.update({
+    const deleted = await this.prisma.user.update({
       where: { id: userId },
       data: { deletedAt: new Date() },
     });
+
+    await this.publishUserDeleted(userId, 'soft-delete').catch((e) =>
+      this.logger.warn(`Failed to publish user.deleted: ${(e as Error).message}`),
+    );
+
+    return deleted;
   }
 
   /// Get identity report
@@ -563,6 +600,70 @@ export class IdentityService {
         aiEnabled,
         aiEnabledAt: new Date(),
       },
+    });
+  }
+
+  // ──────────────────────────────────────────────────────────────────────
+  // CQRS event publishers
+  //
+  // These run AFTER Postgres writes have committed. Sync-service consumes
+  // `data.#` and projects into MongoDB. We always re-read the user/identity
+  // from Postgres to make sure the payload reflects the final state — never
+  // construct the event from DTO fields alone (those may not be the latest).
+  // ──────────────────────────────────────────────────────────────────────
+
+  /**
+   * Emit a snapshot of (user + identity-just-touched). Idempotent: sync's
+   * IdentityProjector upserts and dedupes the identities array, so replaying
+   * is safe. We also emit a `user.created` event the first time only.
+   */
+  private async publishUserSnapshot(
+    userId: string,
+    channel: string,
+    channelUserId: string,
+    opts: { isNewUser?: boolean } = {},
+  ): Promise<void> {
+    const [user, identity] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: userId } }),
+      this.prisma.userIdentity.findUnique({
+        where: { channelUserId_channel: { channelUserId, channel } },
+      }),
+    ]);
+
+    if (!user || !identity) {
+      this.logger.warn(
+        `publishUserSnapshot: missing user (${!!user}) or identity (${!!identity}) for ${userId} ${channel}:${channelUserId}`,
+      );
+      return;
+    }
+
+    const payload = {
+      userId: user.id,
+      channel: identity.channel,
+      channelUserId: identity.channelUserId,
+      displayName: identity.displayName ?? user.realName ?? null,
+      realName: user.realName ?? null,
+      avatarUrl: identity.avatarUrl ?? null,
+      linkedAt: identity.updatedAt.toISOString(),
+    };
+
+    if (opts.isNewUser) {
+      await this.rabbitmq.publish(DATA_EVENTS.USER_CREATED, payload);
+    }
+    await this.rabbitmq.publish(DATA_EVENTS.USER_LINKED, payload);
+  }
+
+  /** Announce a (soft) deletion to the read model. */
+  private async publishUserDeleted(
+    userId: string,
+    reason: 'soft-delete' | 'merged',
+    extra: Record<string, unknown> = {},
+  ): Promise<void> {
+    await this.rabbitmq.publish(DATA_EVENTS.USER_DELETED, {
+      userId,
+      reason,
+      deletedAt: new Date().toISOString(),
+      ...extra,
     });
   }
 }
