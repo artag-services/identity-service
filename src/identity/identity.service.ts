@@ -23,6 +23,7 @@ const DATA_EVENTS = {
   USER_CREATED: 'data.identity.user.created',
   USER_LINKED: 'data.identity.user.linked',
   USER_NAME_UPDATED: 'data.identity.user.name-updated',
+  USER_AI_UPDATED: 'data.identity.user.ai-settings-updated',
   USER_DELETED: 'data.identity.user.deleted',
 } as const;
 
@@ -70,6 +71,9 @@ export class IdentityService {
       this.logger.debug(`Identity already exists for user ${existingIdentity.userId}`);
       await this.updateUserIdentity(existingIdentity.id, dto);
       user = existingIdentity.user;
+      // CQRS: emit snapshot so sync-service picks up updated displayName/avatarUrl
+      await this.publishUserSnapshot(user.id, dto.channel, dto.channelUserId)
+        .catch((e) => this.logger.warn(`Failed to publish post-update snapshot: ${(e as Error).message}`));
     } else {
       // Try to match with existing user by phone, email, or username
       const match = await this.findMatchingUser(dto);
@@ -222,6 +226,17 @@ export class IdentityService {
           },
         },
       });
+
+      await this.rabbitmq.publish(DATA_EVENTS.USER_NAME_UPDATED, {
+        userId,
+        previousName: user.realName,
+        newName: dto.displayName,
+        channel: dto.channel,
+        trustScore,
+      }).catch((e) =>
+        this.logger.warn(`Failed to publish user.name-updated: ${(e as Error).message}`)
+      );
+
       return updatedUser;
     } else if (dto.displayName && !user.nicknames.includes(dto.displayName)) {
       // Add as nickname if not already there
@@ -594,13 +609,21 @@ export class IdentityService {
   async updateAISettings(userId: string, aiEnabled: boolean): Promise<User> {
     this.logger.log(`Updating AI settings for user ${userId}: aiEnabled=${aiEnabled}`);
 
-    return this.prisma.user.update({
+    const updated = await this.prisma.user.update({
       where: { id: userId },
       data: {
         aiEnabled,
         aiEnabledAt: new Date(),
       },
     });
+
+    await this.rabbitmq.publish(DATA_EVENTS.USER_AI_UPDATED, {
+      userId: updated.id,
+      aiEnabled: updated.aiEnabled,
+      updatedAt: updated.updatedAt.toISOString(),
+    });
+
+    return updated;
   }
 
   // ──────────────────────────────────────────────────────────────────────
@@ -644,6 +667,7 @@ export class IdentityService {
       displayName: identity.displayName ?? user.realName ?? null,
       realName: user.realName ?? null,
       avatarUrl: identity.avatarUrl ?? null,
+      aiEnabled: user.aiEnabled,
       linkedAt: identity.updatedAt.toISOString(),
     };
 
