@@ -2,12 +2,13 @@ import {
   Controller,
   HttpCode,
   HttpStatus,
+  Inject,
   Logger,
   Post,
   UseGuards,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { RabbitMQService } from '../rabbitmq/rabbitmq.service';
+import { IEventPublisher } from '../domain/ports/IEventPublisher';
 import { AdminGuard } from './admin.guard';
 
 const PAGE = 500;
@@ -30,7 +31,7 @@ export class BackfillController {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly rabbitmq: RabbitMQService,
+    @Inject('IEventPublisher') private readonly eventBus: IEventPublisher,
   ) {}
 
   @Post('backfill-events')
@@ -54,7 +55,7 @@ export class BackfillController {
 
       for (const u of users) {
         for (const identity of u.identities) {
-          await this.rabbitmq.publish('data.identity.user.linked', {
+          this.eventBus.publish('data.identity.user.linked', {
             userId: u.id,
             channel: identity.channel,
             channelUserId: identity.channelUserId,
@@ -80,7 +81,7 @@ export class BackfillController {
       });
       if (deleted.length === 0) break;
       for (const u of deleted) {
-        await this.rabbitmq.publish('data.identity.user.deleted', {
+        this.eventBus.publish('data.identity.user.deleted', {
           userId: u.id,
           reason: 'soft-delete',
           deletedAt: (u.deletedAt as Date).toISOString(),
